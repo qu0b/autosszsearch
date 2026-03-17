@@ -1056,10 +1056,19 @@ func (ctx *ReflectionCtx) unmarshalBitlist(_ *ssztypes.TypeDescriptor, targetVal
 	}
 
 	// Bitlists can only be []byte (validated by typecache)
-	byteSlice := make([]byte, sszLen)
-	_, err := decoder.DecodeBytes(byteSlice)
-	if err != nil {
-		return err
+	var byteSlice []byte
+	if ctx.zeroCopyBufs && decoder.Seekable() {
+		buf, err := decoder.DecodeBytesBuf(sszLen)
+		if err != nil {
+			return err
+		}
+		byteSlice = buf
+	} else {
+		byteSlice = make([]byte, sszLen)
+		_, err := decoder.DecodeBytes(byteSlice)
+		if err != nil {
+			return err
+		}
 	}
 
 	if byteSlice[sszLen-1] == 0x00 {
