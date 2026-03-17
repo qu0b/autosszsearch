@@ -1,0 +1,87 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Number ('0.x.y')"
+        required: true
+
+permissions: read-all
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Prepare release
+      run: |
+        chmod +x .github/scripts/prepare-release.sh
+        .github/scripts/prepare-release.sh ${{ inputs.version }}
+
+    - name: "Generate release changelog"
+      id: changelog
+      run: |
+        git fetch --tags
+        prev_tag=$(git tag --sort=-version:refname | grep -e "^v[0-9.]*$" | head -n 1)
+        echo "previous release: $prev_tag"
+        if [ "$prev_tag" ]; then
+          changelog=$(git log --oneline --merges --first-parent --no-decorate $prev_tag..HEAD)
+        else
+          changelog=$(git log --oneline --merges --first-parent --no-decorate)
+        fi
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo " - ${changelog//$'\n'/$'\n' - }" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        echo "prev_tag=$prev_tag" >> $GITHUB_OUTPUT
+
+    - name: "Generate AI release notes"
+      id: ai_release_notes
+      run: |
+        ./.github/scripts/ai-release-notes.sh "${{ steps.changelog.outputs.prev_tag }}"
+      env:
+        OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+        OPENROUTER_TOKEN: ${{ secrets.OPENROUTER_TOKEN }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+
+    - uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
+      id: auto_commit
+      with:
+        commit_message: "release `${{ inputs.version }}`"
+        branch: master
+        push_options: '--force'
+        skip_checkout: true
+
+    - name: Create and push tag (v${{ inputs.version }})
+      run: |
+        git tag "v${{ inputs.version }}" ${{ steps.auto_commit.outputs.commit_hash }}
+        git push origin "v${{ inputs.version }}"
+
+    - name: Create draft release
+      uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1
+      id: create_release
+      with:
+        draft: true
+        prerelease: false
+        release_name: "v${{ inputs.version }}"
+        tag_name: "v${{ inputs.version }}"
+        commitish: ${{ steps.auto_commit.outputs.commit_hash }}
+        body: |
+          ${{ steps.ai_release_notes.outputs.release_notes }}
+
+          <details>
+            <summary>Full changelog</summary>
+
+            ### Full changelog
+          ${{ steps.changelog.outputs.changelog }}
+          </details>
+      env:
+        GITHUB_TOKEN: ${{ github.token }}

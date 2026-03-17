@@ -1,0 +1,244 @@
+// Copyright (c) 2025 pk910
+// SPDX-License-Identifier: Apache-2.0
+// This file is part of the dynamic-ssz library.
+
+package reflection
+
+import (
+	"math/big"
+	"reflect"
+
+	"github.com/pk910/dynamic-ssz/ssztypes"
+	"github.com/pk910/dynamic-ssz/sszutils"
+)
+
+// getSszValueSize calculates the exact SSZ-encoded size of a value.
+//
+// This internal function is used by SizeSSZ to determine buffer requirements for serialization.
+// It recursively traverses the value structure, calculating sizes based on SSZ encoding rules:
+//   - Fixed-size types have predetermined sizes
+//   - Dynamic types require 4-byte offset markers plus their content size
+//   - Arrays multiply element size by length
+//   - Slices account for actual length and any padding from size hints
+//
+// The function optimizes performance by delegating to fastssz's SizeSSZ method when:
+//   - The type implements the fastssz Marshaler interface
+//   - The type and all nested types have static sizes (no dynamic spec values)
+//
+// Parameters:
+//   - targetType: The TypeDescriptor containing type metadata and size information
+//   - targetValue: The reflect.Value containing the actual data to size
+//
+// Returns:
+//   - uint32: The exact number of bytes needed to encode this value
+//   - error: An error if sizing fails (e.g., slice exceeds maximum size)
+//
+// Special handling:
+//   - Nil pointers are sized as zero-valued instances
+//   - Dynamic slices include padding for size hint compliance
+//   - Struct fields are sized based on their static/dynamic nature
+func (ctx *ReflectionCtx) getSszValueSize(targetType *ssztypes.TypeDescriptor, targetValue reflect.Value) (uint32, error) {
+	staticSize := uint32(0)
+
+	if targetType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 && targetType.SszType != ssztypes.SszOptionalType {
+		if targetValue.IsNil() {
+			targetValue = reflect.New(targetType.Type.Elem()).Elem()
+		} else {
+			targetValue = targetValue.Elem()
+		}
+	}
+
+	// Fast path: skip compat interface checks for types that don't implement any
+	if targetType.SszCompatFlags != 0 || targetType.SszType == ssztypes.SszCustomType {
+		useFastSsz := !ctx.noFastSsz && targetType.SszCompatFlags&ssztypes.SszCompatFlagFastSSZMarshaler != 0
+		if !useFastSsz && targetType.SszType == ssztypes.SszCustomType {
+			useFastSsz = true
+		}
+
+		if useFastSsz {
+			if marshaller, ok := getPtr(targetValue).Interface().(sszutils.FastsszMarshaler); ok {
+				return uint32(marshaller.SizeSSZ()), nil
+			}
+		}
+
+		if targetType.SszCompatFlags&ssztypes.SszCompatFlagDynamicSizer != 0 {
+			if sizer, ok := getPtr(targetValue).Interface().(sszutils.DynamicSizer); ok {
+				return uint32(sizer.SizeSSZDyn(ctx.ds)), nil
+			}
+		}
+	}
+
+	switch targetType.SszType {
+	case ssztypes.SszTypeWrapperType:
+		// Extract the Data field from the TypeWrapper
+		dataField := targetValue.Field(0)
+
+		// Calculate size for the wrapped value using its type descriptor
+		size, err := ctx.getSszValueSize(targetType.ElemDesc, dataField)
+		if err != nil {
+			return 0, err
+		}
+		staticSize = size
+	case ssztypes.SszContainerType, ssztypes.SszProgressiveContainerType:
+		sizeFields := targetType.ContainerDesc.Fields
+		for i := 0; i < len(sizeFields); i++ {
+			fieldType := &sizeFields[i]
+			fieldValue := targetValue.Field(i)
+
+			if fieldType.Type.SszTypeFlags&ssztypes.SszTypeFlagIsDynamic != 0 {
+				size, err := ctx.getSszValueSize(fieldType.Type, fieldValue)
+				if err != nil {
+					return 0, err
+				}
+
+				// dynamic field, add 4 bytes for offset
+				staticSize += size + 4
+			} else {
+				// static field
+				staticSize += fieldType.Type.Size
+			}
+		}
+	case ssztypes.SszVectorType, ssztypes.SszBitvectorType:
+		fieldType := targetType.ElemDesc
+		switch {
+		case fieldType.Kind == reflect.Uint8:
+			staticSize = targetType.Len
+		case fieldType.SszTypeFlags&ssztypes.SszTypeFlagIsDynamic != 0:
+			// vector with dynamic size items, so we have to go through each item
+			dataLen := targetValue.Len()
+
+			for i := 0; i < dataLen; i++ {
+				size, err := ctx.getSszValueSize(fieldType, targetValue.Index(i))
+				if err != nil {
+					return 0, sszutils.ErrorWithPathf(err, "[%d]", i)
+				}
+				// add 4 bytes for offset in dynamic array
+				staticSize += size + 4
+			}
+
+			if uint32(dataLen) < targetType.Len {
+				appendZero := targetType.Len - uint32(dataLen)
+				zeroVal := reflect.New(fieldType.Type).Elem()
+				size, err := ctx.getSszValueSize(fieldType, zeroVal)
+				if err != nil {
+					return 0, sszutils.ErrorWithPathf(err, "[+%d:%d]", dataLen, uint32(dataLen)+appendZero-1)
+				}
+
+				staticSize += (size + 4) * appendZero
+			}
+		default:
+			dataLen := targetValue.Len()
+
+			if dataLen > 0 {
+				size, err := ctx.getSszValueSize(fieldType, targetValue.Index(0))
+				if err != nil {
+					return 0, sszutils.ErrorWithPathf(err, "[0:%d]", dataLen-1)
+				}
+
+				staticSize = size * targetType.Len
+			} else {
+				zeroVal := reflect.New(fieldType.Type).Elem()
+				size, err := ctx.getSszValueSize(fieldType, zeroVal)
+				if err != nil {
+					return 0, sszutils.ErrorWithPathf(err, "[+0:%d]", targetType.Len-1)
+				}
+
+				staticSize += size * targetType.Len
+			}
+		}
+	case ssztypes.SszListType, ssztypes.SszBitlistType, ssztypes.SszProgressiveListType, ssztypes.SszProgressiveBitlistType:
+		fieldType := targetType.ElemDesc
+		sliceLen := uint32(targetValue.Len())
+
+		if sliceLen > 0 {
+			switch {
+			case fieldType.Kind == reflect.Uint8:
+				staticSize = sliceLen
+			case fieldType.SszTypeFlags&ssztypes.SszTypeFlagIsDynamic != 0:
+				// slice with dynamic size items, so we have to go through each item
+				for i := 0; i < int(sliceLen); i++ {
+					size, err := ctx.getSszValueSize(fieldType, targetValue.Index(i))
+					if err != nil {
+						return 0, sszutils.ErrorWithPathf(err, "[%d]", i)
+					}
+					// add 4 bytes for offset in dynamic slice
+					staticSize += size + 4
+				}
+			default:
+				staticSize = fieldType.Size * sliceLen
+			}
+		}
+	case ssztypes.SszCompatibleUnionType:
+		// CompatibleUnion: 1 byte for selector + size of the data
+		variant := uint8(targetValue.Field(0).Uint())
+		dataField := targetValue.Field(1)
+
+		// Get the variant descriptor
+		variantDesc, ok := targetType.UnionVariants[variant]
+		if !ok {
+			return 0, sszutils.NewSszError(sszutils.ErrInvalidUnionVariant, "invalid union variant")
+		}
+
+		// Calculate size of the data
+		dataSize, err := ctx.getSszValueSize(variantDesc, dataField.Elem())
+		if err != nil {
+			return 0, sszutils.ErrorWithPathf(err, "[v:%d]", variant)
+		}
+
+		staticSize = 1 + dataSize // 1 byte selector + data size
+
+	// primitive types
+	case ssztypes.SszBoolType:
+		staticSize = 1
+	case ssztypes.SszUint8Type:
+		staticSize = 1
+	case ssztypes.SszUint16Type:
+		staticSize = 2
+	case ssztypes.SszUint32Type:
+		staticSize = 4
+	case ssztypes.SszUint64Type:
+		staticSize = 8
+	case ssztypes.SszUint128Type:
+		staticSize = 16
+	case ssztypes.SszUint256Type:
+		staticSize = 32
+
+	// extended types
+	case ssztypes.SszInt8Type:
+		staticSize = 1
+	case ssztypes.SszInt16Type:
+		staticSize = 2
+	case ssztypes.SszInt32Type:
+		staticSize = 4
+	case ssztypes.SszInt64Type:
+		staticSize = 8
+	case ssztypes.SszFloat32Type:
+		staticSize = 4
+	case ssztypes.SszFloat64Type:
+		staticSize = 8
+	case ssztypes.SszOptionalType:
+		if targetValue.IsNil() {
+			staticSize = 1
+		} else {
+			// Calculate size of the data
+			dataSize, err := ctx.getSszValueSize(targetType.ElemDesc, targetValue.Elem())
+			if err != nil {
+				return 0, err
+			}
+
+			staticSize = dataSize + 1 // data size + 1 byte availability
+		}
+	case ssztypes.SszBigIntType:
+		bigInt, isBigInt := targetValue.Interface().(big.Int)
+		if !isBigInt {
+			return 0, sszutils.NewSszErrorf(sszutils.ErrInvalidValueRange, "big.Int type expected, got %v", targetType.Type.Name())
+		}
+		bigIntBytes := bigInt.Bytes()
+		staticSize = uint32(len(bigIntBytes))
+
+	default:
+		return 0, sszutils.NewSszErrorf(sszutils.ErrNotImplemented, "unhandled reflection kind in size check: %v", targetType.Kind)
+	}
+
+	return staticSize, nil
+}

@@ -1,0 +1,29 @@
+coverage:
+  status:
+    project: off
+    patch: off
+
+ignore:
+  - "codegen/tests/**"
+  - "fuzz/**"
+  - "spectests/**"
+
+comment:
+  layout: "header, diff, flags, components"
+
+component_management:
+  individual_components:
+    - component_id: package_dynssz
+      name: dynssz
+      paths:
+        - "*"
+        - "hasher/**"
+        - "reflection/**"
+        - "ssztypes/**"
+        - "sszutils/**"
+        - "treeproof/**"
+    - component_id: command_dynsszgen
+      name: dynsszgen
+      paths:
+        - "codegen/**"
+        - "dynssz-gen/**"

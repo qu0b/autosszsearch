@@ -1,0 +1,9 @@
+temp/
+ai_plans/
+profiles/
+coverage/
+coverage.*
+coverage_*
+coverage-*
+dynssz-gen-*
+bin/

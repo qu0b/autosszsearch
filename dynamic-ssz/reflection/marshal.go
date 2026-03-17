@@ -1,0 +1,756 @@
+// Copyright (c) 2025 pk910
+// SPDX-License-Identifier: Apache-2.0
+// This file is part of the dynamic-ssz library.
+
+package reflection
+
+import (
+	"math"
+	"math/big"
+	"reflect"
+	"strings"
+	"time"
+
+	"github.com/pk910/dynamic-ssz/ssztypes"
+	"github.com/pk910/dynamic-ssz/sszutils"
+)
+
+// marshalType is the core recursive generic function for marshalling Go values into SSZ-encoded data.
+//
+// This function serves as the primary dispatcher within the marshalling process, handling both primitive
+// and composite types. It uses the TypeDescriptor's metadata to determine the most efficient encoding
+// path, automatically leveraging fastssz when possible for optimal performance.
+//
+// The generic type parameter E allows the compiler to generate specialized code for each encoder
+// implementation, eliminating interface dispatch overhead.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing optimized metadata about the type to be encoded
+//   - sourceValue: The reflect.Value holding the data to be encoded
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging (when enabled)
+//
+// Returns:
+//   - error: An error if encoding fails
+//
+// The function handles:
+//   - Automatic nil pointer dereferencing
+//   - FastSSZ delegation for compatible types without dynamic sizing
+//   - Primitive type encoding (bool, uint8, uint16, uint32, uint64)
+//   - Delegation to specialized functions for composite types (structs, arrays, slices)
+func (ctx *ReflectionCtx) marshalType(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	if sourceType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 && sourceType.SszType != ssztypes.SszOptionalType {
+		if sourceValue.IsNil() {
+			sourceValue = reflect.New(sourceType.Type.Elem()).Elem()
+		} else {
+			sourceValue = sourceValue.Elem()
+		}
+	}
+
+	if ctx.verbose {
+		isFastsszMarshaler := sourceType.SszCompatFlags&ssztypes.SszCompatFlagFastSSZMarshaler != 0
+		hasDynamicSize := sourceType.SszTypeFlags&ssztypes.SszTypeFlagHasDynamicSize != 0
+		useFastSsz := !ctx.noFastSsz && isFastsszMarshaler && !hasDynamicSize
+		ctx.logCb("%stype: %s\t kind: %v\t fastssz: %v (compat: %v/ dynamic: %v)\n", strings.Repeat(" ", idt), sourceType.Type.Name(), sourceType.Kind, useFastSsz, isFastsszMarshaler, hasDynamicSize)
+	}
+
+	// Fast path: skip compat interface checks for types that don't implement any
+	if sourceType.SszCompatFlags != 0 || sourceType.SszType == ssztypes.SszCustomType {
+		hasDynamicSize := sourceType.SszTypeFlags&ssztypes.SszTypeFlagHasDynamicSize != 0
+		isFastsszMarshaler := sourceType.SszCompatFlags&ssztypes.SszCompatFlagFastSSZMarshaler != 0
+		useDynamicMarshal := sourceType.SszCompatFlags&ssztypes.SszCompatFlagDynamicMarshaler != 0
+		useDynamicEncoder := sourceType.SszCompatFlags&ssztypes.SszCompatFlagDynamicEncoder != 0
+		useFastSsz := !ctx.noFastSsz && isFastsszMarshaler && !hasDynamicSize
+		if !useFastSsz && sourceType.SszType == ssztypes.SszCustomType {
+			useFastSsz = true
+		}
+
+		if useFastSsz {
+			if marshaller, ok := getPtr(sourceValue).Interface().(sszutils.FastsszMarshaler); ok {
+				newBuf, err := marshaller.MarshalSSZTo(encoder.GetBuffer())
+				if err != nil {
+					return err
+				}
+				encoder.SetBuffer(newBuf)
+				return nil
+			}
+		}
+
+		if useDynamicEncoder {
+			if !encoder.Seekable() || !useDynamicMarshal {
+				// prefer dynamic marshaller for seekable encoders (buffer based)
+				if sszEncoder, ok := getPtr(sourceValue).Interface().(sszutils.DynamicEncoder); ok {
+					return sszEncoder.MarshalSSZEncoder(ctx.ds, encoder)
+				}
+			}
+		}
+
+		if useDynamicMarshal {
+			if marshaller, ok := getPtr(sourceValue).Interface().(sszutils.DynamicMarshaler); ok {
+				newBuf, err := marshaller.MarshalSSZDyn(ctx.ds, encoder.GetBuffer())
+				if err != nil {
+					return err
+				}
+				encoder.SetBuffer(newBuf)
+				return nil
+			}
+		}
+	}
+
+	var err error
+	switch sourceType.SszType {
+	// complex types
+	case ssztypes.SszTypeWrapperType:
+		err = ctx.marshalTypeWrapper(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszContainerType, ssztypes.SszProgressiveContainerType:
+		err = ctx.marshalContainer(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszVectorType, ssztypes.SszBitvectorType, ssztypes.SszUint128Type, ssztypes.SszUint256Type:
+		if sourceType.ElemDesc.SszTypeFlags&ssztypes.SszTypeFlagIsDynamic != 0 {
+			err = ctx.marshalDynamicVector(sourceType, sourceValue, encoder, idt)
+		} else {
+			err = ctx.marshalVector(sourceType, sourceValue, encoder, idt)
+		}
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszListType, ssztypes.SszProgressiveListType:
+		if sourceType.ElemDesc.SszTypeFlags&ssztypes.SszTypeFlagIsDynamic != 0 {
+			err = ctx.marshalDynamicList(sourceType, sourceValue, encoder, idt)
+		} else {
+			err = ctx.marshalList(sourceType, sourceValue, encoder, idt)
+		}
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszBitlistType, ssztypes.SszProgressiveBitlistType:
+		err = ctx.marshalBitlist(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszCompatibleUnionType:
+		err = ctx.marshalCompatibleUnion(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+
+	// primitive types
+	case ssztypes.SszBoolType:
+		encoder.EncodeBool(sourceValue.Bool())
+	case ssztypes.SszUint8Type:
+		encoder.EncodeUint8(uint8(sourceValue.Uint()))
+	case ssztypes.SszUint16Type:
+		encoder.EncodeUint16(uint16(sourceValue.Uint()))
+	case ssztypes.SszUint32Type:
+		encoder.EncodeUint32(uint32(sourceValue.Uint()))
+	case ssztypes.SszUint64Type:
+		if sourceType.GoTypeFlags&ssztypes.GoTypeFlagIsTime != 0 {
+			timeValue, isTime := sourceValue.Interface().(time.Time)
+			if !isTime {
+				return sszutils.NewSszErrorf(sszutils.ErrInvalidValueRange, "time.Time type expected, got %v", sourceType.Type.Name())
+			}
+			encoder.EncodeUint64(uint64(timeValue.Unix()))
+		} else {
+			encoder.EncodeUint64(sourceValue.Uint())
+		}
+
+	// extended types
+	case ssztypes.SszInt8Type:
+		encoder.EncodeUint8(uint8(sourceValue.Int()))
+	case ssztypes.SszInt16Type:
+		encoder.EncodeUint16(uint16(sourceValue.Int()))
+	case ssztypes.SszInt32Type:
+		encoder.EncodeUint32(uint32(sourceValue.Int()))
+	case ssztypes.SszInt64Type:
+		encoder.EncodeUint64(uint64(sourceValue.Int()))
+	case ssztypes.SszFloat32Type:
+		encoder.EncodeUint32(math.Float32bits(float32(sourceValue.Float())))
+	case ssztypes.SszFloat64Type:
+		encoder.EncodeUint64(math.Float64bits(sourceValue.Float()))
+	case ssztypes.SszOptionalType:
+		err = ctx.marshalOptional(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+	case ssztypes.SszBigIntType:
+		err = ctx.marshalBigInt(sourceType, sourceValue, encoder, idt)
+		if err != nil {
+			return err
+		}
+	default:
+		return sszutils.NewSszErrorf(sszutils.ErrNotImplemented, "unknown type: %v", sourceType)
+	}
+
+	return nil
+}
+
+// marshalTypeWrapper marshals a TypeWrapper by extracting its data field and marshaling it as the wrapped type.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing wrapper field metadata
+//   - sourceValue: The reflect.Value of the wrapper to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if any field encoding fails
+//
+// The function validates that the Data field is present and marshals the wrapped value using its type descriptor.
+func (ctx *ReflectionCtx) marshalTypeWrapper(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	if ctx.verbose {
+		ctx.logCb("%smarshalTypeWrapper: %s\n", strings.Repeat(" ", idt), sourceType.Type.Name())
+	}
+
+	// Extract the Data field from the TypeWrapper
+	dataField := sourceValue.Field(0)
+
+	// Marshal the wrapped value using its type descriptor
+	return ctx.marshalType(sourceType.ElemDesc, dataField, encoder, idt+2)
+}
+
+// marshalContainer handles the encoding of container values into SSZ-encoded data.
+//
+// This function implements the SSZ specification for container encoding, which requires:
+//   - Fixed-size fields are encoded first in field definition order
+//   - Variable-size fields are encoded after all fixed fields
+//   - Variable-size fields are prefixed with 4-byte offsets in the fixed section
+//
+// The function uses the pre-computed TypeDescriptor to efficiently navigate the container's
+// layout without repeated reflection calls.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing container field metadata
+//   - sourceValue: The reflect.Value of the container to encode (must be a struct)
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if any field encoding fails
+func (ctx *ReflectionCtx) marshalContainer(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	fields := sourceType.ContainerDesc.Fields
+	fieldCount := len(fields)
+
+	// Fast path: containers with no dynamic fields (e.g. Validator)
+	if len(sourceType.ContainerDesc.DynFields) == 0 {
+		for i := 0; i < fieldCount; i++ {
+			field := &fields[i]
+			fieldValue := sourceValue.Field(i)
+			if err := ctx.marshalType(field.Type, fieldValue, encoder, idt+2); err != nil {
+				return sszutils.ErrorWithPath(err, field.Name)
+			}
+		}
+		return nil
+	}
+
+	offset := 0
+	dynObjOffset := 0
+	canSeek := encoder.Seekable()
+	startLen := encoder.GetPosition()
+
+	for i := 0; i < fieldCount; i++ {
+		field := &fields[i]
+		fieldSize := field.Type.Size
+		if fieldSize > 0 {
+			// fmt.Printf("%sfield %d:\t static [%v:%v] %v\t %v\n", strings.Repeat(" ", idt+1), i, offset, offset+fieldSize, fieldSize, field.Name)
+
+			fieldValue := sourceValue.Field(i)
+			err := ctx.marshalType(field.Type, fieldValue, encoder, idt+2)
+			if err != nil {
+				return sszutils.ErrorWithPath(err, field.Name)
+			}
+		} else {
+			fieldSize = 4
+			if canSeek {
+				// we can seek, so we'll update the offset later
+				encoder.EncodeOffset(0)
+			} else {
+				// we can't seek, so we need to calculate the object size now
+				size, err := ctx.getSszValueSize(field.Type, sourceValue.Field(i))
+				if err != nil {
+					return sszutils.ErrorWithPathf(err, "%s:o", field.Name)
+				}
+
+				encoder.EncodeOffset(sourceType.Len + uint32(dynObjOffset))
+				dynObjOffset += int(size)
+			}
+			// fmt.Printf("%sfield %d:\t offset [%v:%v] %v\t %v\n", strings.Repeat(" ", idt+1), i, offset, offset+fieldSize, fieldSize, field.Name)
+		}
+		offset += int(fieldSize)
+	}
+
+	curPos := encoder.GetPosition()
+	for _, field := range sourceType.ContainerDesc.DynFields {
+		// set field offset
+		if canSeek {
+			fieldOffset := int(field.HeaderOffset)
+			encoder.EncodeOffsetAt(fieldOffset+startLen, uint32(offset))
+		}
+
+		// fmt.Printf("%sfield %d:\t dynamic [%v:]\t %v\n", strings.Repeat(" ", idt+1), field.Index[0], offset, field.Name)
+
+		fieldDescriptor := field.Field
+		fieldValue := sourceValue.Field(int(field.Index))
+		err := ctx.marshalType(fieldDescriptor.Type, fieldValue, encoder, idt+2)
+		if err != nil {
+			return sszutils.ErrorWithPath(err, fieldDescriptor.Name)
+		}
+
+		if canSeek {
+			newPos := encoder.GetPosition()
+			offset += newPos - curPos
+			curPos = newPos
+		}
+	}
+
+	return nil
+}
+
+// marshalVector encodes vector values into SSZ-encoded data.
+//
+// Vectors in SSZ are encoded as fixed-size sequences where each element is encoded
+// sequentially without any length prefix (since the length is known from the type).
+// For byte arrays ([N]byte) or slices ([]byte), the function uses an optimized path that directly
+// appends the bytes without element-wise iteration.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing vector metadata including element type and length
+//   - sourceValue: The reflect.Value of the vector to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if any element encoding fails
+//
+// Special handling:
+//   - Byte arrays use reflect.Value.Bytes() for efficient bulk copying
+//   - Non-addressable arrays are made addressable via a temporary pointer
+func (ctx *ReflectionCtx) marshalVector(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	vecLen := int64(sourceType.Len)
+	if vecLen > math.MaxInt {
+		return sszutils.NewSszErrorf(sszutils.ErrPlatformOverflow, "vector length %d exceeds platform int max", sourceType.Len)
+	}
+	vecElemSize := int64(sourceType.ElemDesc.Size)
+	if vecElemSize > math.MaxInt {
+		return sszutils.NewSszErrorf(sszutils.ErrPlatformOverflow, "element size %d exceeds platform int max", sourceType.ElemDesc.Size)
+	}
+
+	sliceLen := sourceValue.Len()
+	if uint32(sliceLen) > sourceType.Len {
+		if sourceType.Kind == reflect.Array {
+			sliceLen = int(vecLen)
+		} else {
+			return sszutils.ErrListTooBig
+		}
+	}
+
+	appendZero := 0
+	dataLen := int(vecLen)
+	if uint32(sliceLen) < sourceType.Len {
+		appendZero = int(vecLen) - sliceLen
+		dataLen = sliceLen
+	}
+
+	if sourceType.GoTypeFlags&(ssztypes.GoTypeFlagIsByteArray|ssztypes.GoTypeFlagIsString) != 0 {
+		// shortcut for performance: use append on []byte arrays
+		if !sourceValue.CanAddr() {
+			// workaround for unaddressable static arrays
+			sourceValPtr := reflect.New(sourceType.Type)
+			sourceValPtr.Elem().Set(sourceValue)
+			sourceValue = sourceValPtr.Elem()
+		}
+
+		var bytes []byte
+		if sourceType.GoTypeFlags&ssztypes.GoTypeFlagIsString != 0 {
+			bytes = []byte(sourceValue.String())
+		} else {
+			bytes = sourceValue.Bytes()
+		}
+
+		encoder.EncodeBytes(bytes[:dataLen])
+
+		if appendZero > 0 {
+			encoder.EncodeZeroPadding(appendZero)
+		} else if sourceType.BitSize > 0 && sourceType.BitSize < uint32(len(bytes))*8 {
+			// check padding bits
+			paddingMask := uint8((uint16(0xff) << (sourceType.BitSize % 8)) & 0xff)
+			paddingBits := bytes[dataLen-1] & paddingMask
+			if paddingBits != 0 {
+				return sszutils.NewSszError(sszutils.ErrInvalidValueRange, "bitvector padding bits are not zero")
+			}
+		}
+	} else {
+		for i := 0; i < dataLen; i++ {
+			itemVal := sourceValue.Index(i)
+			err := ctx.marshalType(sourceType.ElemDesc, itemVal, encoder, idt+2)
+			if err != nil {
+				return sszutils.ErrorWithPathf(err, "[%d]", i)
+			}
+		}
+
+		if appendZero > 0 {
+			totalZeroBytes := int(vecElemSize) * appendZero
+			encoder.EncodeZeroPadding(totalZeroBytes)
+		}
+	}
+
+	return nil
+}
+
+// marshalDynamicVector encodes vectors with variable-size elements into SSZ format.
+//
+// For vectors with variable-size elements, SSZ requires a special encoding:
+//  1. A series of 4-byte offsets, one per element, indicating where each element's data begins
+//  2. The actual encoded data for each element, in order
+//
+// The offsets are relative to the start of the vector encoding (not the entire message).
+// This allows decoders to locate each variable-size element without parsing all preceding elements.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor with vector metadata
+//   - sourceValue: The reflect.Value of the vector to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if encoding fails or size constraints are violated
+//
+// The function handles size hints for padding with zero values when the list
+// length is less than the expected size. Zero values are efficiently batched
+// to minimize encoding overhead.
+func (ctx *ReflectionCtx) marshalDynamicVector(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	dynVecLen := int64(sourceType.Len)
+	if dynVecLen > math.MaxInt {
+		return sszutils.NewSszErrorf(sszutils.ErrPlatformOverflow, "dynamic vector length %d exceeds platform int max", sourceType.Len)
+	}
+
+	fieldType := sourceType.ElemDesc
+	sliceLen := sourceValue.Len()
+
+	appendZero := 0
+	if sourceType.Kind == reflect.Slice || sourceType.Kind == reflect.String {
+		innerSliceLen := sourceValue.Len()
+		if uint32(innerSliceLen) > sourceType.Len {
+			return sszutils.ErrListTooBig
+		}
+		if uint32(innerSliceLen) < sourceType.Len {
+			appendZero = int(dynVecLen) - innerSliceLen
+		}
+	}
+
+	canSeek := encoder.Seekable()
+	startOffset := encoder.GetPosition()
+	totalOffsets := sliceLen + appendZero
+	offset := uint32(4 * totalOffsets)
+
+	var zeroVal reflect.Value
+	if appendZero > 0 {
+		if fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 {
+			zeroVal = reflect.New(fieldType.Type.Elem())
+		} else {
+			zeroVal = reflect.New(fieldType.Type).Elem()
+		}
+	}
+
+	if canSeek {
+		encoder.EncodeZeroPadding(4 * totalOffsets) // Reserve space for offsets
+	} else {
+		// need to calculate the object sizes now
+		for i := 0; i < sliceLen; i++ {
+			itemVal := sourceValue.Index(i)
+			size, err := ctx.getSszValueSize(fieldType, itemVal)
+			if err != nil {
+				return sszutils.ErrorWithPathf(err, "[%d]", i)
+			}
+
+			encoder.EncodeOffset(offset)
+			offset += size
+		}
+		if appendZero > 0 {
+			size, err := ctx.getSszValueSize(fieldType, zeroVal)
+			if err != nil {
+				return sszutils.ErrorWithPathf(err, "[+%d:%d]", sliceLen, sliceLen+appendZero-1)
+			}
+
+			for i := 0; i < appendZero; i++ {
+				encoder.EncodeOffset(offset)
+				offset += size
+			}
+		}
+	}
+
+	bufLen := encoder.GetPosition()
+
+	for i := 0; i < sliceLen; i++ {
+		itemVal := sourceValue.Index(i)
+
+		err := ctx.marshalType(fieldType, itemVal, encoder, idt+2)
+		if err != nil {
+			return sszutils.ErrorWithPathf(err, "[%d]", i)
+		}
+
+		if canSeek {
+			encoder.EncodeOffsetAt(startOffset+(i*4), offset)
+
+			newPos := encoder.GetPosition()
+			offset += uint32(newPos - bufLen)
+			bufLen = newPos
+		}
+	}
+
+	for i := 0; i < appendZero; i++ {
+		err := ctx.marshalType(fieldType, zeroVal, encoder, idt+2)
+		if err != nil {
+			return sszutils.ErrorWithPathf(err, "[+%d]", sliceLen+i)
+		}
+
+		if canSeek {
+			encoder.EncodeOffsetAt(startOffset+((sliceLen+i)*4), offset)
+
+			newPos := encoder.GetPosition()
+			offset += uint32(newPos - bufLen)
+			bufLen = newPos
+		}
+	}
+
+	return nil
+}
+
+// marshalList encodes list values into SSZ-encoded data.
+//
+// This function handles lists with fixed-size elements. The encoding follows SSZ specifications
+// where lists are encoded as their elements in sequence without a length prefix.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing slice metadata and element type information
+//   - sourceValue: The reflect.Value of the slice to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if encoding fails or slice exceeds size constraints
+//
+// Special handling:
+//   - Byte slices use optimized bulk append
+//   - Returns ErrListTooBig if slice exceeds maximum size from hints
+func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	switch {
+	case sourceType.GoTypeFlags&ssztypes.GoTypeFlagIsString != 0:
+		stringBytes := []byte(sourceValue.String())
+		encoder.EncodeBytes(stringBytes)
+	case sourceType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0:
+		encoder.EncodeBytes(sourceValue.Bytes())
+	default:
+		sliceLen := sourceValue.Len()
+		fieldType := sourceType.ElemDesc
+		isPointer := fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0
+
+		for i := 0; i < sliceLen; i++ {
+			itemVal := sourceValue.Index(i)
+			if isPointer && itemVal.IsNil() {
+				itemVal = reflect.New(fieldType.Type.Elem())
+			}
+
+			err := ctx.marshalType(fieldType, itemVal, encoder, idt+2)
+			if err != nil {
+				return sszutils.ErrorWithPathf(err, "[%d]", i)
+			}
+		}
+	}
+
+	return nil
+}
+
+// marshalDynamicList encodes lists with variable-size elements into SSZ format.
+//
+// For lists with variable-size elements, SSZ requires a special encoding:
+//  1. A series of 4-byte offsets, one per element, indicating where each element's data begins
+//  2. The actual encoded data for each element, in order
+//
+// The offsets are relative to the start of the list encoding (not the entire message).
+// This allows decoders to locate each variable-size element without parsing all preceding elements.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor with list metadata
+//   - sourceValue: The reflect.Value of the list to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if encoding fails or size constraints are violated
+func (ctx *ReflectionCtx) marshalDynamicList(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	fieldType := sourceType.ElemDesc
+	sliceLen := sourceValue.Len()
+
+	canSeek := encoder.Seekable()
+	startOffset := encoder.GetPosition()
+	totalOffsets := sliceLen
+	offset := uint32(4 * totalOffsets)
+
+	if canSeek {
+		encoder.EncodeZeroPadding(4 * totalOffsets) // Reserve space for offsets
+	} else if sliceLen > 0 {
+		// need to calculate the object sizes now
+		encoder.EncodeOffset(offset)
+
+		for i := 0; i < sliceLen-1; i++ {
+			itemVal := sourceValue.Index(i)
+			size, err := ctx.getSszValueSize(fieldType, itemVal)
+			if err != nil {
+				return sszutils.ErrorWithPathf(err, "[%d]", i)
+			}
+
+			offset += size
+			encoder.EncodeOffset(offset)
+		}
+	}
+
+	bufLen := encoder.GetPosition()
+
+	for i := 0; i < sliceLen; i++ {
+		itemVal := sourceValue.Index(i)
+
+		err := ctx.marshalType(fieldType, itemVal, encoder, idt+2)
+		if err != nil {
+			return sszutils.ErrorWithPathf(err, "[%d]", i)
+		}
+
+		if canSeek {
+			encoder.EncodeOffsetAt(startOffset+(i*4), offset)
+
+			newPos := encoder.GetPosition()
+			offset += uint32(newPos - bufLen)
+			bufLen = newPos
+		}
+	}
+
+	return nil
+}
+
+// marshalBitlist encodes bitlist values into SSZ-encoded data.
+//
+// This function handles bitlist encoding. The encoding follows SSZ specifications
+// where bitlists are encoded as their bits in sequence without a length prefix.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing bitlist metadata
+//   - sourceValue: The reflect.Value of the bitlist to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if encoding fails or bitlist exceeds size constraints
+func (ctx *ReflectionCtx) marshalBitlist(_ *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, _ int) error {
+	bytes := sourceValue.Bytes()
+
+	// check if last byte contains termination bit
+	if len(bytes) == 0 {
+		// empty bitlist, simply append termination bit (0x01)
+		// this is a fallback for uninitialized bitlists
+		bytes = []byte{0x01}
+	} else if bytes[len(bytes)-1] == 0x00 {
+		return sszutils.NewSszError(sszutils.ErrBitlistNotTerminated, "bitlist misses mandatory termination bit")
+	}
+
+	encoder.EncodeBytes(bytes)
+
+	return nil
+}
+
+// marshalCompatibleUnion encodes CompatibleUnion values into SSZ-encoded data.
+//
+// According to the spec:
+//   - The encoding is: selector.to_bytes(1, "little") + serialize(value.data)
+//   - The selector index is based at 0 if a ProgressiveContainer type option is present
+//   - Otherwise, it is based at 1
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing union metadata and variant descriptors
+//   - sourceValue: The reflect.Value of the CompatibleUnion to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if encoding fails
+func (ctx *ReflectionCtx) marshalCompatibleUnion(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	// We know CompatibleUnion has exactly 2 fields: Variant (uint8) and Data (interface{})
+	// Field 0 is Variant, Field 1 is Data
+	variant := uint8(sourceValue.Field(0).Uint())
+	dataField := sourceValue.Field(1)
+
+	// Append variant byte
+	encoder.EncodeUint8(variant)
+
+	// Get the variant descriptor
+	variantDesc, ok := sourceType.UnionVariants[variant]
+	if !ok {
+		return sszutils.NewSszError(sszutils.ErrInvalidUnionVariant, "invalid union variant")
+	}
+
+	// Marshal the data using the variant's type descriptor
+	err := ctx.marshalType(variantDesc, dataField.Elem(), encoder, idt+2)
+	if err != nil {
+		return sszutils.ErrorWithPathf(err, "[v:%d]", variant)
+	}
+
+	return nil
+}
+
+// marshalOptional marshals an Optional by marshaling its data field as the wrapped type.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing optional field metadata
+//   - sourceValue: The reflect.Value of the optional to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if any field encoding fails
+//
+// The function validates that the Data field is present and marshals the wrapped value using its type descriptor.
+func (ctx *ReflectionCtx) marshalOptional(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	if ctx.verbose {
+		ctx.logCb("%smarshalOptional: %s\n", strings.Repeat(" ", idt), sourceType.Type.Name())
+	}
+
+	if sourceValue.IsNil() {
+		encoder.EncodeBool(false)
+		return nil
+	}
+
+	encoder.EncodeBool(true)
+
+	// Marshal the wrapped value using its type descriptor
+	return ctx.marshalType(sourceType.ElemDesc, sourceValue.Elem(), encoder, idt+2)
+}
+
+// marshalBigInt marshals a BigInt by marshaling its data field as the wrapped type.
+//
+// Parameters:
+//   - sourceType: The TypeDescriptor containing big int field metadata
+//   - sourceValue: The reflect.Value of the big int to encode
+//   - encoder: The encoder instance used to write SSZ-encoded data
+//   - idt: Indentation level for verbose logging
+//
+// Returns:
+//   - error: An error if any field encoding fails
+//
+// The function validates that the Data field is present and marshals the wrapped value using its type descriptor.
+func (ctx *ReflectionCtx) marshalBigInt(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, encoder sszutils.Encoder, idt int) error {
+	if ctx.verbose {
+		ctx.logCb("%smarshalBigInt: %s\n", strings.Repeat(" ", idt), sourceType.Type.Name())
+	}
+
+	bigInt, isBigInt := sourceValue.Interface().(big.Int)
+	if !isBigInt {
+		return sszutils.NewSszErrorf(sszutils.ErrInvalidValueRange, "big.Int type expected, got %v", sourceType.Type.Name())
+	}
+	bigIntBytes := bigInt.Bytes()
+	encoder.EncodeBytes(bigIntBytes)
+
+	return nil
+}
