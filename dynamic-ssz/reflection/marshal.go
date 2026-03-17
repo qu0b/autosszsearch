@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/pk910/dynamic-ssz/ssztypes"
 	"github.com/pk910/dynamic-ssz/sszutils"
@@ -384,6 +385,25 @@ func (ctx *ReflectionCtx) marshalVector(sourceType *ssztypes.TypeDescriptor, sou
 			}
 		}
 	} else {
+		// Bulk memcpy fast path: for non-pointer elements where Go type size
+		// matches SSZ element size and the type is byte-compatible, copy the
+		// entire backing array directly to the encoder buffer.
+		elemDesc := sourceType.ElemDesc
+		if dataLen > 0 && encoder.Seekable() && sourceValue.CanAddr() &&
+			elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer == 0 {
+			elemGoSize := sourceValue.Type().Elem().Size()
+			if uintptr(vecElemSize) == elemGoSize && isBulkMemcpyable(elemDesc) {
+				totalBytes := dataLen * int(vecElemSize)
+				basePtr := unsafe.Pointer(sourceValue.Index(0).UnsafeAddr())
+				src := unsafe.Slice((*byte)(basePtr), totalBytes)
+				encoder.EncodeBytes(src)
+				if appendZero > 0 {
+					encoder.EncodeZeroPadding(int(vecElemSize) * appendZero)
+				}
+				return nil
+			}
+		}
+
 		for i := 0; i < dataLen; i++ {
 			itemVal := sourceValue.Index(i)
 			err := ctx.marshalType(sourceType.ElemDesc, itemVal, encoder, idt+2)
@@ -548,6 +568,38 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 		sliceLen := sourceValue.Len()
 		fieldType := sourceType.ElemDesc
 		isPointer := fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0
+
+		// Bulk memcpy fast path for non-pointer byte-compatible elements
+		if sliceLen > 0 && !isPointer && encoder.Seekable() && sourceValue.CanAddr() {
+			elemGoSize := sourceValue.Type().Elem().Size()
+			if uintptr(fieldType.Size) == elemGoSize && isBulkMemcpyable(fieldType) {
+				totalBytes := sliceLen * int(fieldType.Size)
+				basePtr := unsafe.Pointer(sourceValue.Index(0).UnsafeAddr())
+				src := unsafe.Slice((*byte)(basePtr), totalBytes)
+				encoder.EncodeBytes(src)
+				return nil
+			}
+		}
+
+		// Batch marshal for lists of pointer-to-static-container elements
+		if sliceLen > 0 && isPointer && encoder.Seekable() {
+			innerType := fieldType.ElemDesc
+			if innerType != nil && innerType.SszType == ssztypes.SszContainerType &&
+				innerType.ContainerDesc != nil && len(innerType.ContainerDesc.DynFields) == 0 {
+				elemVal := sourceValue.Index(0).Elem()
+				if plan := getBatchCopyPlan(innerType, elemVal.Type()); plan != nil {
+					for i := 0; i < sliceLen; i++ {
+						elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
+						for j := range plan {
+							e := &plan[j]
+							src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
+							encoder.EncodeBytes(src)
+						}
+					}
+					return nil
+				}
+			}
+		}
 
 		for i := 0; i < sliceLen; i++ {
 			itemVal := sourceValue.Index(i)
