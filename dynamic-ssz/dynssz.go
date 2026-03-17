@@ -6,6 +6,7 @@
 package dynssz
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -832,4 +833,215 @@ func (d *DynSsz) ValidateType(t reflect.Type) error {
 	}
 
 	return nil
+}
+
+// ReadUint64 reads a uint64 field from SSZ-encoded data at the given field path
+// without performing a full unmarshal. The path is a list of field indices
+// that navigate through containers to the target uint64 field.
+//
+// Example: ReadUint64(reflect.TypeOf((*SignedBeaconBlock)(nil)), data, 0, 0)
+// navigates: SignedBeaconBlock.Message(field 0).Slot(field 0)
+func (d *DynSsz) ReadUint64(rootType reflect.Type, data []byte, fieldPath ...int) (uint64, error) {
+	typeDesc, err := d.typeCache.GetTypeDescriptor(rootType, nil, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	buf := data
+	currentType := typeDesc
+
+	for _, fieldIdx := range fieldPath {
+		if currentType.ContainerDesc == nil {
+			return 0, fmt.Errorf("expected container type at field path index %d", fieldIdx)
+		}
+		fields := currentType.ContainerDesc.Fields
+		if fieldIdx >= len(fields) {
+			return 0, fmt.Errorf("field index %d out of range (max %d)", fieldIdx, len(fields)-1)
+		}
+
+		// Calculate offset to the target field
+		offset := 0
+		for i := 0; i < fieldIdx; i++ {
+			fSize := int(fields[i].Type.Size)
+			if fSize > 0 {
+				offset += fSize
+			} else {
+				offset += 4 // dynamic field offset placeholder
+			}
+		}
+
+		fieldType := fields[fieldIdx].Type
+		fSize := int(fieldType.Size)
+		if fSize > 0 {
+			// Static field: data is inline at the computed offset
+			buf = buf[offset:]
+		} else {
+			// Dynamic field: read the 4-byte offset, then navigate there
+			if len(buf) < offset+4 {
+				return 0, fmt.Errorf("data too short for offset at position %d", offset)
+			}
+			dynOffset := int(binary.LittleEndian.Uint32(buf[offset:]))
+			buf = buf[dynOffset:]
+		}
+
+		currentType = fieldType
+	}
+
+	// Read the uint64 value
+	if len(buf) < 8 {
+		return 0, fmt.Errorf("data too short for uint64 read")
+	}
+	return binary.LittleEndian.Uint64(buf[:8]), nil
+}
+
+// ReadListLength reads the number of elements in an SSZ list field.
+// The path navigates to the list field, and the element size is used to
+// compute the count from the list's byte length.
+func (d *DynSsz) ReadListLength(rootType reflect.Type, data []byte, fieldPath ...int) (int, error) {
+	typeDesc, err := d.typeCache.GetTypeDescriptor(rootType, nil, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	buf := data
+	currentType := typeDesc
+
+	for pathIdx, fieldIdx := range fieldPath {
+		if currentType.ContainerDesc == nil {
+			return 0, fmt.Errorf("expected container type at path position %d", pathIdx)
+		}
+		fields := currentType.ContainerDesc.Fields
+		if fieldIdx >= len(fields) {
+			return 0, fmt.Errorf("field index %d out of range", fieldIdx)
+		}
+
+		// Compute offset
+		offset := 0
+		for i := 0; i < fieldIdx; i++ {
+			fSize := int(fields[i].Type.Size)
+			if fSize > 0 {
+				offset += fSize
+			} else {
+				offset += 4
+			}
+		}
+
+		fieldType := fields[fieldIdx].Type
+		fSize := int(fieldType.Size)
+
+		isLastField := pathIdx == len(fieldPath)-1
+		if isLastField {
+			// This should be the list field - compute its byte length
+			if fSize > 0 {
+				return 0, fmt.Errorf("expected dynamic field for list, got static")
+			}
+			// Read this field's start offset
+			if len(buf) < offset+4 {
+				return 0, fmt.Errorf("data too short")
+			}
+			startOff := int(binary.LittleEndian.Uint32(buf[offset:]))
+
+			// Find the end offset (next dynamic field's offset or end of data)
+			endOff := len(buf)
+			nextDynOffset := offset + 4
+			for i := fieldIdx + 1; i < len(fields); i++ {
+				if int(fields[i].Type.Size) > 0 {
+					nextDynOffset += int(fields[i].Type.Size)
+				} else {
+					// Next dynamic field - its offset tells us where current field ends
+					if len(buf) >= nextDynOffset+4 {
+						endOff = int(binary.LittleEndian.Uint32(buf[nextDynOffset:]))
+					}
+					break
+				}
+			}
+
+			listBytes := endOff - startOff
+			elemType := fieldType
+			if elemType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 && elemType.ElemDesc != nil {
+				elemType = elemType.ElemDesc
+			}
+
+			elemSize := int(elemType.ElemDesc.Size)
+			if elemSize == 0 {
+				// Dynamic-size elements: count from first offset
+				if listBytes < 4 {
+					return 0, nil
+				}
+				firstOff := int(binary.LittleEndian.Uint32(buf[startOff:]))
+				return firstOff / 4, nil
+			}
+			return listBytes / elemSize, nil
+		}
+
+		if fSize > 0 {
+			buf = buf[offset:]
+		} else {
+			if len(buf) < offset+4 {
+				return 0, fmt.Errorf("data too short")
+			}
+			dynOffset := int(binary.LittleEndian.Uint32(buf[offset:]))
+			buf = buf[dynOffset:]
+		}
+
+		currentType = fieldType
+		if currentType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 && currentType.ElemDesc != nil {
+			currentType = currentType.ElemDesc
+		}
+	}
+
+	return 0, fmt.Errorf("empty field path")
+}
+
+// ReadUint64FromList reads a uint64 value from a list at the given element index.
+// The path navigates to the list field, then the index specifies which element.
+func (d *DynSsz) ReadUint64FromList(rootType reflect.Type, data []byte, elemIndex int, fieldPath ...int) (uint64, error) {
+	typeDesc, err := d.typeCache.GetTypeDescriptor(rootType, nil, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	buf := data
+	currentType := typeDesc
+
+	for _, fieldIdx := range fieldPath {
+		if currentType.ContainerDesc == nil {
+			return 0, fmt.Errorf("expected container type")
+		}
+		fields := currentType.ContainerDesc.Fields
+		if fieldIdx >= len(fields) {
+			return 0, fmt.Errorf("field index out of range")
+		}
+
+		offset := 0
+		for i := 0; i < fieldIdx; i++ {
+			fSize := int(fields[i].Type.Size)
+			if fSize > 0 {
+				offset += fSize
+			} else {
+				offset += 4
+			}
+		}
+
+		fieldType := fields[fieldIdx].Type
+		fSize := int(fieldType.Size)
+		if fSize > 0 {
+			buf = buf[offset:]
+		} else {
+			if len(buf) < offset+4 {
+				return 0, fmt.Errorf("data too short")
+			}
+			dynOffset := int(binary.LittleEndian.Uint32(buf[offset:]))
+			buf = buf[dynOffset:]
+		}
+
+		currentType = fieldType
+	}
+
+	// Now buf points to the start of the list data, read element at index
+	elemOffset := elemIndex * 8
+	if len(buf) < elemOffset+8 {
+		return 0, fmt.Errorf("element index out of range")
+	}
+	return binary.LittleEndian.Uint64(buf[elemOffset:]), nil
 }

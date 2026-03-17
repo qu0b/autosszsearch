@@ -8,10 +8,18 @@ package autosszsearch
 // function calls into the library, not reimplementations.
 
 import (
+	"reflect"
+
 	ssz "github.com/pk910/dynamic-ssz"
 )
 
 var dynSsz = ssz.NewDynSsz(nil)
+
+// Type handles for zero-copy field access
+var (
+	signedBeaconBlockType = reflect.TypeOf((*SignedBeaconBlock)(nil))
+	beaconStateType       = reflect.TypeOf((*BeaconState)(nil))
+)
 
 // --- Unmarshal ---
 
@@ -52,40 +60,24 @@ func HashTreeRootState(state *BeaconState) ([32]byte, error) {
 }
 
 // --- Selective field access ---
-// Baseline: full unmarshal then read field.
-// Agent should replace these with library-level zero-copy APIs.
+// Zero-copy: navigate SSZ offsets to read fields without full unmarshal.
 
 func ReadBlockSlot(data []byte) (uint64, error) {
-	block, err := UnmarshalBlock(data)
-	if err != nil {
-		return 0, err
-	}
-	return block.Message.Slot, nil
+	// SignedBeaconBlock.Message(0).Slot(0)
+	return dynSsz.ReadUint64(signedBeaconBlockType, data, 0, 0)
 }
 
 func ReadStateSlot(data []byte) (uint64, error) {
-	state, err := UnmarshalState(data)
-	if err != nil {
-		return 0, err
-	}
-	return state.Slot, nil
+	// BeaconState.Slot(2)
+	return dynSsz.ReadUint64(beaconStateType, data, 2)
 }
 
 func ReadStateValidatorCount(data []byte) (int, error) {
-	state, err := UnmarshalState(data)
-	if err != nil {
-		return 0, err
-	}
-	return len(state.Validators), nil
+	// BeaconState.Validators(11)
+	return dynSsz.ReadListLength(beaconStateType, data, 11)
 }
 
 func ReadStateBalance(data []byte, validatorIndex int) (uint64, error) {
-	state, err := UnmarshalState(data)
-	if err != nil {
-		return 0, err
-	}
-	if validatorIndex >= len(state.Balances) {
-		return 0, nil
-	}
-	return state.Balances[validatorIndex], nil
+	// BeaconState.Balances(12)
+	return dynSsz.ReadUint64FromList(beaconStateType, data, validatorIndex, 12)
 }
