@@ -23,10 +23,11 @@ import (
 // It wraps a DynamicSpecs provider for resolving dynamic field sizes, along
 // with options controlling fastssz fallback behavior and logging.
 type ReflectionCtx struct {
-	ds        sszutils.DynamicSpecs
-	logCb     func(format string, args ...any)
-	verbose   bool
-	noFastSsz bool
+	ds           sszutils.DynamicSpecs
+	logCb        func(format string, args ...any)
+	verbose      bool
+	noFastSsz    bool
+	zeroCopyBufs bool // when true, []byte fields reference the SSZ buffer directly
 }
 
 // NewReflectionCtx creates a new ReflectionCtx with the given configuration.
@@ -44,6 +45,13 @@ func NewReflectionCtx(ds sszutils.DynamicSpecs, logCb func(format string, args .
 		verbose:   verbose,
 		noFastSsz: noFastSsz,
 	}
+}
+
+// SetZeroCopyBufs enables zero-copy mode where decoded []byte fields reference
+// the SSZ input buffer directly instead of allocating and copying. The caller
+// must ensure the SSZ buffer outlives the decoded struct and is not modified.
+func (ctx *ReflectionCtx) SetZeroCopyBufs(enabled bool) {
+	ctx.zeroCopyBufs = enabled
 }
 
 func getPtr(v reflect.Value) reflect.Value {

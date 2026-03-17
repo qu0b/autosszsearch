@@ -13,7 +13,7 @@ import (
 	ssz "github.com/pk910/dynamic-ssz"
 )
 
-var dynSsz = ssz.NewDynSsz(nil)
+var dynSsz = ssz.NewDynSsz(nil, ssz.WithZeroCopyBufs())
 
 // Type handles for zero-copy field access
 var (

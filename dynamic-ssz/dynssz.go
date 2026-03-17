@@ -475,6 +475,7 @@ func (d *DynSsz) UnmarshalSSZ(target any, ssz []byte) error {
 	}
 
 	ctx := reflection.NewReflectionCtx(d, d.options.LogCb, d.options.Verbose, d.options.NoFastSsz)
+	ctx.SetZeroCopyBufs(d.options.ZeroCopyBufs)
 
 	decoder := sszutils.NewBufferDecoder(ssz)
 	decoder.PushLimit(len(ssz))

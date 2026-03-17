@@ -491,8 +491,12 @@ func (ctx *ReflectionCtx) unmarshalVector(targetType *ssztypes.TypeDescriptor, t
 	case reflect.Slice:
 		// Optimization: avoid reflect.MakeSlice for common byte slice types
 		if targetType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 && targetType.ElemDesc.Type.Kind() == reflect.Uint8 {
-			byteSlice := make([]byte, arrLen)
-			newValue = reflect.ValueOf(byteSlice)
+			if ctx.zeroCopyBufs && decoder.Seekable() {
+				// Zero-copy: reference SSZ buffer directly, skip allocation
+			} else {
+				byteSlice := make([]byte, arrLen)
+				newValue = reflect.ValueOf(byteSlice)
+			}
 		} else {
 			newValue = reflect.MakeSlice(targetType.Type, arrLen, arrLen)
 		}
@@ -511,6 +515,13 @@ func (ctx *ReflectionCtx) unmarshalVector(targetType *ssztypes.TypeDescriptor, t
 				return err
 			}
 			newValue.SetString(string(buf))
+		} else if ctx.zeroCopyBufs && decoder.Seekable() && targetType.Kind == reflect.Slice {
+			// Zero-copy: return a slice referencing the SSZ buffer directly
+			buf, err := decoder.DecodeBytesBuf(arrLen)
+			if err != nil {
+				return err
+			}
+			newValue = reflect.ValueOf(buf)
 		} else {
 			var buf []byte
 			if targetType.Kind == reflect.Array {
@@ -829,8 +840,12 @@ func (ctx *ReflectionCtx) unmarshalList(targetType *ssztypes.TypeDescriptor, tar
 	if targetType.Kind == reflect.Slice {
 		// Optimization: avoid reflect.MakeSlice for common byte slice types
 		if targetType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 && fieldType.Type.Kind() == reflect.Uint8 {
-			byteSlice := make([]byte, sliceLen)
-			newValue = reflect.ValueOf(byteSlice)
+			if ctx.zeroCopyBufs && decoder.Seekable() {
+				// Zero-copy: defer allocation, will reference SSZ buffer
+			} else {
+				byteSlice := make([]byte, sliceLen)
+				newValue = reflect.ValueOf(byteSlice)
+			}
 		} else {
 			newValue = reflect.MakeSlice(fieldT, sliceLen, sliceLen)
 		}
@@ -848,10 +863,19 @@ func (ctx *ReflectionCtx) unmarshalList(targetType *ssztypes.TypeDescriptor, tar
 		}
 		newValue.SetString(string(buf))
 	case targetType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0:
-		// shortcut for performance: use copy on []byte arrays
-		_, err := decoder.DecodeBytes(newValue.Bytes())
-		if err != nil {
-			return err
+		if ctx.zeroCopyBufs && decoder.Seekable() {
+			// Zero-copy: reference SSZ buffer directly
+			buf, err := decoder.DecodeBytesBuf(sliceLen)
+			if err != nil {
+				return err
+			}
+			newValue = reflect.ValueOf(buf)
+		} else {
+			// shortcut for performance: use copy on []byte arrays
+			_, err := decoder.DecodeBytes(newValue.Bytes())
+			if err != nil {
+				return err
+			}
 		}
 	default:
 		// decode list items

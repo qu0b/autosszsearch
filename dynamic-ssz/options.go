@@ -14,6 +14,7 @@ type DynSszOptions struct {
 	NoFastHash             bool
 	ExtendedTypes          bool
 	Verbose                bool
+	ZeroCopyBufs           bool
 	LogCb                  func(format string, args ...any)
 	StreamWriterBufferSize int
 	StreamReaderBufferSize int
@@ -73,5 +74,14 @@ func WithStreamWriterBufferSize(size int) DynSszOption {
 func WithStreamReaderBufferSize(size int) DynSszOption {
 	return func(opts *DynSszOptions) {
 		opts.StreamReaderBufferSize = size
+	}
+}
+
+// WithZeroCopyBufs enables zero-copy mode where decoded []byte fields reference
+// the SSZ input buffer directly instead of allocating and copying. The caller
+// must ensure the SSZ buffer outlives the decoded struct and is not modified.
+func WithZeroCopyBufs() DynSszOption {
+	return func(opts *DynSszOptions) {
+		opts.ZeroCopyBufs = true
 	}
 }
