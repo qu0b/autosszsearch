@@ -741,8 +741,23 @@ func (ctx *ReflectionCtx) unmarshalFixedElements(fieldType *ssztypes.TypeDescrip
 	if isPointer && count > 0 {
 		elemType := fieldType.Type.Elem()
 		backing = reflect.MakeSlice(reflect.SliceOf(elemType), count, count)
-		for i := 0; i < count; i++ {
-			newValue.Index(i).Set(backing.Index(i).Addr())
+
+		// Use unsafe to set pointers into backing array, avoiding per-element
+		// reflect.Index + Addr + Set overhead (3 reflect ops → 1 unsafe store).
+		if count > 16 {
+			backingBase := backing.Index(0).UnsafeAddr()
+			elemGoSize := elemType.Size()
+			sliceBase := newValue.Index(0).UnsafeAddr()
+			ptrSize := unsafe.Sizeof(uintptr(0))
+			for i := 0; i < count; i++ {
+				elemAddr := backingBase + uintptr(i)*elemGoSize
+				ptrSlot := (*uintptr)(unsafe.Pointer(sliceBase + uintptr(i)*ptrSize))
+				*ptrSlot = elemAddr
+			}
+		} else {
+			for i := 0; i < count; i++ {
+				newValue.Index(i).Set(backing.Index(i).Addr())
+			}
 		}
 	}
 
