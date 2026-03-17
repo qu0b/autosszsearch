@@ -654,17 +654,55 @@ func (ctx *ReflectionCtx) buildRootFromList(sourceType *ssztypes.TypeDescriptor,
 
 		hh.AppendBytes32(bytes)
 	} else {
-		// For other types, process each element
 		arrayLen := sourceValue.Len()
-		for i := 0; i < arrayLen; i++ {
-			fieldValue := sourceValue.Index(i)
 
-			err := ctx.buildRootFromType(sourceType.ElemDesc, fieldValue, hh, true, idt+2)
-			if err != nil {
-				return sszutils.ErrorWithPathf(err, "[%d]", i)
+		// Batch HTR for lists of pointer-to-static-container elements:
+		// skip per-element buildRootFromType dispatch and inline the container hashing.
+		elemDesc := sourceType.ElemDesc
+		batchHTR := false
+		if arrayLen > 0 && elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 &&
+			elemDesc.SszType == ssztypes.SszContainerType &&
+			elemDesc.ContainerDesc != nil && len(elemDesc.ContainerDesc.DynFields) == 0 {
+			firstElem := sourceValue.Index(0)
+			if !firstElem.IsNil() {
+				if plan := getHTRPlan(elemDesc, firstElem.Elem().Type()); plan != nil {
+					batchHTR = true
+					for i := 0; i < arrayLen; i++ {
+						elemVal := sourceValue.Index(i)
+						if elemVal.IsNil() {
+							// Nil pointer: hash as zero-value container
+							for range plan {
+								hh.PutBytes(nil)
+							}
+						} else {
+							containerHashIdx := hh.StartTree(sszutils.TreeTypeNone)
+							basePtr := unsafe.Pointer(elemVal.Elem().UnsafeAddr())
+							for j := range plan {
+								e := &plan[j]
+								src := unsafe.Slice((*byte)(unsafe.Add(basePtr, e.goOff)), e.size)
+								hh.PutBytes(src)
+							}
+							hh.Merkleize(containerHashIdx)
+						}
+						if (i+1)%128 == 0 {
+							hh.Collapse()
+						}
+					}
+				}
 			}
-			if (i+1)%128 == 0 {
-				hh.Collapse()
+		}
+
+		if !batchHTR {
+			for i := 0; i < arrayLen; i++ {
+				fieldValue := sourceValue.Index(i)
+
+				err := ctx.buildRootFromType(sourceType.ElemDesc, fieldValue, hh, true, idt+2)
+				if err != nil {
+					return sszutils.ErrorWithPathf(err, "[%d]", i)
+				}
+				if (i+1)%128 == 0 {
+					hh.Collapse()
+				}
 			}
 		}
 
