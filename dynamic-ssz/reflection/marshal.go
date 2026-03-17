@@ -608,10 +608,16 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 					sszSize := int(fieldType.Len)
 					totalBytes := sliceLen * sszSize
 					needed := pos + totalBytes
+
+					// Get pointer array base to avoid per-element reflect.Index+Elem+UnsafeAddr
+					ptrArrayBase := sourceValue.Index(0).UnsafeAddr()
+					ptrSize := unsafe.Sizeof(uintptr(0))
+
 					if cap(buf) >= needed {
 						outBuf := buf[:cap(buf)]
 						for i := 0; i < sliceLen; i++ {
-							elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
+							elemAddr := *(*uintptr)(unsafe.Pointer(ptrArrayBase + uintptr(i)*ptrSize))
+							elemPtr := unsafe.Pointer(elemAddr)
 							for j := range plan {
 								e := &plan[j]
 								src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
@@ -622,7 +628,8 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 						encoder.SetBuffer(buf[:pos])
 					} else {
 						for i := 0; i < sliceLen; i++ {
-							elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
+							elemAddr := *(*uintptr)(unsafe.Pointer(ptrArrayBase + uintptr(i)*ptrSize))
+							elemPtr := unsafe.Pointer(elemAddr)
 							for j := range plan {
 								e := &plan[j]
 								src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
