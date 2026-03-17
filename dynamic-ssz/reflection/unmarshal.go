@@ -1279,6 +1279,9 @@ func getHTRPlan(containerType *ssztypes.TypeDescriptor, goType reflect.Type) []h
 		return nil
 	}
 	fields := containerType.ContainerDesc.Fields
+	if structType.NumField() < len(fields) {
+		return nil
+	}
 	for i := range fields {
 		if !isDirectCopyableField(fields[i].Type) {
 			return nil
@@ -1302,7 +1305,13 @@ func getHTRPlan(containerType *ssztypes.TypeDescriptor, goType reflect.Type) []h
 // isBasicIntType checks if a type is a basic integer type (uint8/16/32/64)
 // suitable for bulk AppendBytes32 in HTR. Excludes bool (needs validation),
 // byte-array vectors (need per-element Merkleize), and Time types.
+// On big-endian architectures, only uint8 qualifies because multi-byte
+// integers have different byte order than SSZ's little-endian encoding.
 func isBasicIntType(t *ssztypes.TypeDescriptor) bool {
+	if !nativeEndianIsLittle {
+		return t.SszType == ssztypes.SszUint8Type &&
+			t.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+	}
 	switch t.SszType {
 	case ssztypes.SszUint8Type, ssztypes.SszUint16Type,
 		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
@@ -1315,7 +1324,23 @@ func isBasicIntType(t *ssztypes.TypeDescriptor) bool {
 // isBulkMemcpyable checks if an element type can be bulk-copied in lists/vectors.
 // Similar to isDirectCopyableField but excludes SszBoolType because bool values
 // require per-element validation (0x00 or 0x01 only).
+// Returns false on big-endian architectures where multi-byte integers have
+// different byte order than SSZ's little-endian encoding.
 func isBulkMemcpyable(fieldType *ssztypes.TypeDescriptor) bool {
+	if !nativeEndianIsLittle {
+		// Only single-byte types and byte arrays are safe on big-endian
+		switch fieldType.SszType {
+		case ssztypes.SszUint8Type:
+			return fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+		case ssztypes.SszVectorType:
+			return fieldType.Kind == reflect.Array &&
+				fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 &&
+				fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsString == 0 &&
+				fieldType.BitSize == 0
+		default:
+			return false
+		}
+	}
 	switch fieldType.SszType {
 	case ssztypes.SszUint8Type, ssztypes.SszUint16Type,
 		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
@@ -1331,8 +1356,24 @@ func isBulkMemcpyable(fieldType *ssztypes.TypeDescriptor) bool {
 }
 
 // isDirectCopyableField checks if a field's SSZ encoding is byte-compatible
-// with Go's in-memory representation on little-endian architectures.
+// with Go's in-memory representation. Multi-byte integers require little-endian
+// native byte order; on big-endian architectures only single-byte types and
+// byte arrays qualify.
 func isDirectCopyableField(fieldType *ssztypes.TypeDescriptor) bool {
+	if !nativeEndianIsLittle {
+		// On big-endian, only single-byte types and byte arrays are byte-compatible
+		switch fieldType.SszType {
+		case ssztypes.SszBoolType, ssztypes.SszUint8Type:
+			return fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+		case ssztypes.SszVectorType:
+			return fieldType.Kind == reflect.Array &&
+				fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 &&
+				fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsString == 0 &&
+				fieldType.BitSize == 0
+		default:
+			return false
+		}
+	}
 	switch fieldType.SszType {
 	case ssztypes.SszBoolType, ssztypes.SszUint8Type, ssztypes.SszUint16Type,
 		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
@@ -1363,6 +1404,11 @@ func getBatchCopyPlan(containerType *ssztypes.TypeDescriptor, elemGoType reflect
 		return nil
 	}
 	fields := containerType.ContainerDesc.Fields
+	// Reject if Go struct has fewer fields than SSZ container — field index would be wrong.
+	// This catches struct embedding, unexported fields, or mismatched type definitions.
+	if structType.NumField() < len(fields) {
+		return nil
+	}
 	for i := 0; i < len(fields); i++ {
 		if !isDirectCopyableField(fields[i].Type) {
 			return nil

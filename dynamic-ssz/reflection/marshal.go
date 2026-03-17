@@ -617,6 +617,14 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 						outBuf := buf[:cap(buf)]
 						for i := 0; i < sliceLen; i++ {
 							elemAddr := *(*uintptr)(unsafe.Pointer(ptrArrayBase + uintptr(i)*ptrSize))
+							if elemAddr == 0 {
+								// Nil element: encode as zero bytes
+								for k := 0; k < sszSize; k++ {
+									outBuf[pos+k] = 0
+								}
+								pos += sszSize
+								continue
+							}
 							elemPtr := unsafe.Pointer(elemAddr)
 							for j := range plan {
 								e := &plan[j]
@@ -629,6 +637,10 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 					} else {
 						for i := 0; i < sliceLen; i++ {
 							elemAddr := *(*uintptr)(unsafe.Pointer(ptrArrayBase + uintptr(i)*ptrSize))
+							if elemAddr == 0 {
+								encoder.EncodeZeroPadding(sszSize)
+								continue
+							}
 							elemPtr := unsafe.Pointer(elemAddr)
 							for j := range plan {
 								e := &plan[j]

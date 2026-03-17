@@ -41,17 +41,12 @@ func UnmarshalState(data []byte) (*BeaconState, error) {
 
 // --- Marshal ---
 
-var marshalBlockBuf = make([]byte, 0, 2*1024*1024) // 2MB for blocks
-
 func MarshalBlock(block *SignedBeaconBlock) ([]byte, error) {
-	return dynSsz.MarshalSSZTo(block, marshalBlockBuf[:0])
+	return dynSsz.MarshalSSZ(block)
 }
 
-// marshalStateBuf is a pre-allocated buffer for state marshaling to skip SizeSSZ.
-var marshalStateBuf = make([]byte, 0, 64*1024*1024) // 64MB should cover any state
-
 func MarshalState(state *BeaconState) ([]byte, error) {
-	return dynSsz.MarshalSSZTo(state, marshalStateBuf[:0])
+	return dynSsz.MarshalSSZ(state)
 }
 
 // --- HashTreeRoot ---
