@@ -720,16 +720,16 @@ func (ctx *ReflectionCtx) unmarshalFixedElements(fieldType *ssztypes.TypeDescrip
 	// Batch-decode fast path: for lists of static containers with only basic fields,
 	// read all bytes at once and use direct memory copies to skip per-element reflection.
 	if count > 0 && decoder.Seekable() && isPointer {
-		innerType := fieldType.ElemDesc
-		if innerType != nil && innerType.SszType == ssztypes.SszContainerType &&
-			innerType.ContainerDesc != nil && len(innerType.ContainerDesc.DynFields) == 0 {
-			if plan := getBatchCopyPlan(innerType, backing.Index(0).Type()); plan != nil {
+		// For pointer types, the container descriptor is on the pointer type itself
+		if fieldType.SszType == ssztypes.SszContainerType &&
+			fieldType.ContainerDesc != nil && len(fieldType.ContainerDesc.DynFields) == 0 {
+			if plan := getBatchCopyPlan(fieldType, backing.Index(0).Type()); plan != nil {
 				totalBytes := count * itemSize
 				sszBuf, err := decoder.DecodeBytesBuf(totalBytes)
 				if err != nil {
 					return err
 				}
-				elemSize := int(innerType.Len)
+				elemSize := int(fieldType.Len)
 				backingBase := unsafe.Pointer(backing.Index(0).UnsafeAddr())
 				goStride := backing.Index(0).Type().Size()
 				for i := 0; i < count; i++ {
