@@ -583,11 +583,12 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 
 		// Batch marshal for lists of pointer-to-static-container elements
 		if sliceLen > 0 && isPointer && encoder.Seekable() {
-			innerType := fieldType.ElemDesc
-			if innerType != nil && innerType.SszType == ssztypes.SszContainerType &&
-				innerType.ContainerDesc != nil && len(innerType.ContainerDesc.DynFields) == 0 {
+			// For pointer types, the container descriptor is on the pointer type itself
+			if fieldType.SszType == ssztypes.SszContainerType &&
+				fieldType.ContainerDesc != nil && len(fieldType.ContainerDesc.DynFields) == 0 &&
+				!sourceValue.Index(0).IsNil() {
 				elemVal := sourceValue.Index(0).Elem()
-				if plan := getBatchCopyPlan(innerType, elemVal.Type()); plan != nil {
+				if plan := getBatchCopyPlan(fieldType, elemVal.Type()); plan != nil {
 					for i := 0; i < sliceLen; i++ {
 						elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
 						for j := range plan {
