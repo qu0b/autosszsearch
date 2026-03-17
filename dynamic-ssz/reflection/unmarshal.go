@@ -746,6 +746,24 @@ func (ctx *ReflectionCtx) unmarshalFixedElements(fieldType *ssztypes.TypeDescrip
 		}
 	}
 
+	// Bulk memcpy fast path: for non-pointer elements where SSZ size matches Go type
+	// size and the type is byte-compatible (basic types or byte arrays on LE),
+	// the Go slice backing array has the same layout as the SSZ data.
+	if !isPointer && count > 0 && decoder.Seekable() {
+		elemGoSize := newValue.Type().Elem().Size()
+		if uintptr(itemSize) == elemGoSize && isBulkMemcpyable(fieldType) {
+			totalBytes := count * itemSize
+			sszBuf, err := decoder.DecodeBytesBuf(totalBytes)
+			if err != nil {
+				return err
+			}
+			basePtr := unsafe.Pointer(newValue.Index(0).UnsafeAddr())
+			dst := unsafe.Slice((*byte)(basePtr), totalBytes)
+			copy(dst, sszBuf)
+			return nil
+		}
+	}
+
 	for i := 0; i < count; i++ {
 		itemVal := newValue.Index(i)
 
@@ -1155,6 +1173,24 @@ type batchCopyEntry struct {
 
 // batchCopyPlanCache caches pre-computed copy plans per TypeDescriptor.
 var batchCopyPlanCache sync.Map // map[*ssztypes.TypeDescriptor][]batchCopyEntry
+
+// isBulkMemcpyable checks if an element type can be bulk-copied in lists/vectors.
+// Similar to isDirectCopyableField but excludes SszBoolType because bool values
+// require per-element validation (0x00 or 0x01 only).
+func isBulkMemcpyable(fieldType *ssztypes.TypeDescriptor) bool {
+	switch fieldType.SszType {
+	case ssztypes.SszUint8Type, ssztypes.SszUint16Type,
+		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
+		return fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+	case ssztypes.SszVectorType:
+		return fieldType.Kind == reflect.Array &&
+			fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 &&
+			fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsString == 0 &&
+			fieldType.BitSize == 0
+	default:
+		return false
+	}
+}
 
 // isDirectCopyableField checks if a field's SSZ encoding is byte-compatible
 // with Go's in-memory representation on little-endian architectures.
