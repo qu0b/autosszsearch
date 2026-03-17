@@ -1,0 +1,27 @@
+# Results file (untracked, agent-managed)
+results.tsv
+
+# Agent prompt files (generated per-session)
+CLAUDE.md
+AGENTS.md
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Run logs
+run.log
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Worktrees
+worktrees/
+
+# Large test data files (copy from ssz-benchmark/res/)
+res/*.ssz

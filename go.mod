@@ -1,0 +1,15 @@
+module github.com/pk910/autosszsearch
+
+go 1.25.3
+
+require (
+	github.com/pk910/dynamic-ssz v1.2.2
+	github.com/prysmaticlabs/go-bitfield v0.0.0-20240618144021-706c95b2dd15
+)
+
+require (
+	github.com/casbin/govaluate v1.8.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/pk910/hashtree-bindings v0.0.1 // indirect
+	golang.org/x/sys v0.36.0 // indirect
+)
