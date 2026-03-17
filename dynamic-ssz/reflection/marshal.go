@@ -238,6 +238,19 @@ func (ctx *ReflectionCtx) marshalContainer(sourceType *ssztypes.TypeDescriptor, 
 
 	// Fast path: containers with no dynamic fields (e.g. Validator)
 	if len(sourceType.ContainerDesc.DynFields) == 0 {
+		// Ultra-fast path: batch copy for containers with all basic fields
+		if encoder.Seekable() && sourceValue.CanAddr() {
+			if plan := getBatchCopyPlan(sourceType, sourceValue.Type()); plan != nil {
+				basePtr := unsafe.Pointer(sourceValue.UnsafeAddr())
+				for j := range plan {
+					e := &plan[j]
+					src := unsafe.Slice((*byte)(unsafe.Add(basePtr, e.goOff)), e.size)
+					encoder.EncodeBytes(src)
+				}
+				return nil
+			}
+		}
+
 		for i := 0; i < fieldCount; i++ {
 			field := &fields[i]
 			fieldValue := sourceValue.Field(i)
