@@ -9,6 +9,8 @@ AGENTS.md
 *.exe
 *.test
 *.out
+*.prof
+generate
 
 # Run logs
 run.log
@@ -23,5 +25,7 @@ run.log
 # Worktrees
 worktrees/
 
-# Large test data files (copy from ssz-benchmark/res/)
+# Large test data files (generated via: go run ./cmd/generate)
 res/*.ssz
+res/train/*.ssz
+res/eval/*.ssz
