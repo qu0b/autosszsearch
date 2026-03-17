@@ -632,13 +632,21 @@ func (ctx *ReflectionCtx) unmarshalDynamicVector(targetType *ssztypes.TypeDescri
 		newValue = reflect.MakeSlice(fieldT, vectorLen, vectorLen)
 	}
 
+	// Bulk-allocate backing array for pointer elements
+	isPointerDynVec := fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0
+	if isPointerDynVec && vectorLen > 0 {
+		elemType := fieldType.Type.Elem()
+		backing := reflect.MakeSlice(reflect.SliceOf(elemType), vectorLen, vectorLen)
+		for i := 0; i < vectorLen; i++ {
+			newValue.Index(i).Set(backing.Index(i).Addr())
+		}
+	}
+
 	// decode slice items
 	for i := 0; i < vectorLen; i++ {
 		var itemVal reflect.Value
-		if fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 {
-			// fmt.Printf("new slice item %v\n", fieldType.Name())
-			itemVal = reflect.New(fieldType.Type.Elem())
-			newValue.Index(i).Set(itemVal)
+		if isPointerDynVec {
+			itemVal = newValue.Index(i)
 		} else {
 			itemVal = newValue.Index(i)
 		}
@@ -697,11 +705,21 @@ func (ctx *ReflectionCtx) unmarshalFixedElements(fieldType *ssztypes.TypeDescrip
 	itemSize := int(fieldSize)
 	isPointer := fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0
 
+	// Bulk-allocate backing array for pointer elements to reduce heap allocations
+	// from O(count) to O(1).
+	var backing reflect.Value
+	if isPointer && count > 0 {
+		elemType := fieldType.Type.Elem()
+		backing = reflect.MakeSlice(reflect.SliceOf(elemType), count, count)
+		for i := 0; i < count; i++ {
+			newValue.Index(i).Set(backing.Index(i).Addr())
+		}
+	}
+
 	for i := 0; i < count; i++ {
 		var itemVal reflect.Value
 		if isPointer {
-			itemVal = reflect.New(fieldType.Type.Elem())
-			newValue.Index(i).Set(itemVal.Elem().Addr())
+			itemVal = newValue.Index(i)
 		} else {
 			itemVal = newValue.Index(i)
 		}
@@ -882,16 +900,24 @@ func (ctx *ReflectionCtx) unmarshalDynamicList(targetType *ssztypes.TypeDescript
 
 	newValue := reflect.MakeSlice(fieldT, sliceLen, sliceLen)
 
+	// Bulk-allocate backing array for pointer elements
+	isPointer := fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0
+	if isPointer && sliceLen > 0 {
+		elemType := fieldType.Type.Elem()
+		backing := reflect.MakeSlice(reflect.SliceOf(elemType), sliceLen, sliceLen)
+		for i := 0; i < sliceLen; i++ {
+			newValue.Index(i).Set(backing.Index(i).Addr())
+		}
+	}
+
 	if sliceLen > 0 {
 		offset := firstOffset
 
 		// decode slice items
 		for i := 0; i < sliceLen; i++ {
 			var itemVal reflect.Value
-			if fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 {
-				// fmt.Printf("new slice item %v\n", fieldType.Name())
-				itemVal = reflect.New(fieldType.Type.Elem())
-				newValue.Index(i).Set(itemVal)
+			if isPointer {
+				itemVal = newValue.Index(i)
 			} else {
 				itemVal = newValue.Index(i)
 			}
