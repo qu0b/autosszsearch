@@ -1252,6 +1252,19 @@ func getHTRPlan(containerType *ssztypes.TypeDescriptor, goType reflect.Type) []h
 	return plan
 }
 
+// isBasicIntType checks if a type is a basic integer type (uint8/16/32/64)
+// suitable for bulk AppendBytes32 in HTR. Excludes bool (needs validation),
+// byte-array vectors (need per-element Merkleize), and Time types.
+func isBasicIntType(t *ssztypes.TypeDescriptor) bool {
+	switch t.SszType {
+	case ssztypes.SszUint8Type, ssztypes.SszUint16Type,
+		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
+		return t.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+	default:
+		return false
+	}
+}
+
 // isBulkMemcpyable checks if an element type can be bulk-copied in lists/vectors.
 // Similar to isDirectCopyableField but excludes SszBoolType because bool values
 // require per-element validation (0x00 or 0x01 only).

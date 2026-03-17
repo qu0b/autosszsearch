@@ -656,10 +656,25 @@ func (ctx *ReflectionCtx) buildRootFromList(sourceType *ssztypes.TypeDescriptor,
 	} else {
 		arrayLen := sourceValue.Len()
 
-		// Batch HTR for lists of pointer-to-static-container elements:
-		// skip per-element buildRootFromType dispatch and inline the container hashing.
+		// Bulk append for basic integer lists: on LE, raw bytes can be appended
+		// directly since buildRootFromType for packed integers is just Append*.
 		elemDesc := sourceType.ElemDesc
 		batchHTR := false
+		if arrayLen > 0 && sourceValue.CanAddr() &&
+			elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer == 0 &&
+			isBasicIntType(elemDesc) {
+			elemGoSize := sourceValue.Type().Elem().Size()
+			if uintptr(elemDesc.Size) == elemGoSize {
+				totalBytes := arrayLen * int(elemDesc.Size)
+				basePtr := unsafe.Pointer(sourceValue.Index(0).UnsafeAddr())
+				src := unsafe.Slice((*byte)(basePtr), totalBytes)
+				hh.AppendBytes32(src)
+				batchHTR = true
+			}
+		}
+
+		// Batch HTR for lists of pointer-to-static-container elements:
+		// skip per-element buildRootFromType dispatch and inline the container hashing.
 		if arrayLen > 0 && elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer != 0 &&
 			elemDesc.SszType == ssztypes.SszContainerType &&
 			elemDesc.ContainerDesc != nil && len(elemDesc.ContainerDesc.DynFields) == 0 {
