@@ -667,19 +667,26 @@ func (ctx *ReflectionCtx) unmarshalDynamicVector(targetType *ssztypes.TypeDescri
 	if isPointerDynVec && vectorLen > 0 {
 		elemType := fieldType.Type.Elem()
 		backing := reflect.MakeSlice(reflect.SliceOf(elemType), vectorLen, vectorLen)
-		for i := 0; i < vectorLen; i++ {
-			newValue.Index(i).Set(backing.Index(i).Addr())
+		if vectorLen > 16 {
+			backingBase := backing.Index(0).UnsafeAddr()
+			elemGoSize := elemType.Size()
+			sliceBase := newValue.Index(0).UnsafeAddr()
+			ptrSize := unsafe.Sizeof(uintptr(0))
+			for i := 0; i < vectorLen; i++ {
+				elemAddr := backingBase + uintptr(i)*elemGoSize
+				ptrSlot := (*uintptr)(unsafe.Pointer(sliceBase + uintptr(i)*ptrSize))
+				*ptrSlot = elemAddr
+			}
+		} else {
+			for i := 0; i < vectorLen; i++ {
+				newValue.Index(i).Set(backing.Index(i).Addr())
+			}
 		}
 	}
 
 	// decode slice items
 	for i := 0; i < vectorLen; i++ {
-		var itemVal reflect.Value
-		if isPointerDynVec {
-			itemVal = newValue.Index(i)
-		} else {
-			itemVal = newValue.Index(i)
-		}
+		itemVal := newValue.Index(i)
 
 		startOffset := offset
 
@@ -1005,8 +1012,20 @@ func (ctx *ReflectionCtx) unmarshalDynamicList(targetType *ssztypes.TypeDescript
 	if isPointer && sliceLen > 0 {
 		elemType := fieldType.Type.Elem()
 		backing := reflect.MakeSlice(reflect.SliceOf(elemType), sliceLen, sliceLen)
-		for i := 0; i < sliceLen; i++ {
-			newValue.Index(i).Set(backing.Index(i).Addr())
+		if sliceLen > 16 {
+			backingBase := backing.Index(0).UnsafeAddr()
+			elemGoSize := elemType.Size()
+			sliceBase := newValue.Index(0).UnsafeAddr()
+			ptrSize := unsafe.Sizeof(uintptr(0))
+			for i := 0; i < sliceLen; i++ {
+				elemAddr := backingBase + uintptr(i)*elemGoSize
+				ptrSlot := (*uintptr)(unsafe.Pointer(sliceBase + uintptr(i)*ptrSize))
+				*ptrSlot = elemAddr
+			}
+		} else {
+			for i := 0; i < sliceLen; i++ {
+				newValue.Index(i).Set(backing.Index(i).Addr())
+			}
 		}
 	}
 
@@ -1015,12 +1034,7 @@ func (ctx *ReflectionCtx) unmarshalDynamicList(targetType *ssztypes.TypeDescript
 
 		// decode slice items
 		for i := 0; i < sliceLen; i++ {
-			var itemVal reflect.Value
-			if isPointer {
-				itemVal = newValue.Index(i)
-			} else {
-				itemVal = newValue.Index(i)
-			}
+			itemVal := newValue.Index(i)
 
 			startOffset := offset
 			var endOffset uint32
