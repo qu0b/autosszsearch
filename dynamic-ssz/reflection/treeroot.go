@@ -707,10 +707,10 @@ func (ctx *ReflectionCtx) buildRootFromList(sourceType *ssztypes.TypeDescriptor,
 					// Use unsafe pointer array traversal to avoid per-element reflect overhead
 					ptrArrayBase := sourceValue.Index(0).UnsafeAddr()
 					ptrSize := unsafe.Sizeof(uintptr(0))
+
 					for i := 0; i < arrayLen; i++ {
 						elemAddr := *(*uintptr)(unsafe.Pointer(ptrArrayBase + uintptr(i)*ptrSize))
 						if elemAddr == 0 {
-							// Nil pointer: hash as zero-value container
 							for range plan {
 								hh.PutBytes(nil)
 							}
