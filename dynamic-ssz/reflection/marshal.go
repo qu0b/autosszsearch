@@ -602,12 +602,32 @@ func (ctx *ReflectionCtx) marshalList(sourceType *ssztypes.TypeDescriptor, sourc
 				!sourceValue.Index(0).IsNil() {
 				elemVal := sourceValue.Index(0).Elem()
 				if plan := getBatchCopyPlan(fieldType, elemVal.Type()); plan != nil {
-					for i := 0; i < sliceLen; i++ {
-						elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
-						for j := range plan {
-							e := &plan[j]
-							src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
-							encoder.EncodeBytes(src)
+					// Write directly to encoder buffer to avoid per-copy function call overhead
+					buf := encoder.GetBuffer()
+					pos := encoder.GetPosition()
+					sszSize := int(fieldType.Len)
+					totalBytes := sliceLen * sszSize
+					needed := pos + totalBytes
+					if cap(buf) >= needed {
+						outBuf := buf[:cap(buf)]
+						for i := 0; i < sliceLen; i++ {
+							elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
+							for j := range plan {
+								e := &plan[j]
+								src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
+								copy(outBuf[pos:], src)
+								pos += e.size
+							}
+						}
+						encoder.SetBuffer(buf[:pos])
+					} else {
+						for i := 0; i < sliceLen; i++ {
+							elemPtr := unsafe.Pointer(sourceValue.Index(i).Elem().UnsafeAddr())
+							for j := range plan {
+								e := &plan[j]
+								src := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
+								encoder.EncodeBytes(src)
+							}
 						}
 					}
 					return nil
