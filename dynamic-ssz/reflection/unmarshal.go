@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -716,13 +717,37 @@ func (ctx *ReflectionCtx) unmarshalFixedElements(fieldType *ssztypes.TypeDescrip
 		}
 	}
 
-	for i := 0; i < count; i++ {
-		var itemVal reflect.Value
-		if isPointer {
-			itemVal = newValue.Index(i)
-		} else {
-			itemVal = newValue.Index(i)
+	// Batch-decode fast path: for lists of static containers with only basic fields,
+	// read all bytes at once and use direct memory copies to skip per-element reflection.
+	if count > 0 && decoder.Seekable() && isPointer {
+		innerType := fieldType.ElemDesc
+		if innerType != nil && innerType.SszType == ssztypes.SszContainerType &&
+			innerType.ContainerDesc != nil && len(innerType.ContainerDesc.DynFields) == 0 {
+			if plan := getBatchCopyPlan(innerType, backing.Index(0).Type()); plan != nil {
+				totalBytes := count * itemSize
+				sszBuf, err := decoder.DecodeBytesBuf(totalBytes)
+				if err != nil {
+					return err
+				}
+				elemSize := int(innerType.Len)
+				backingBase := unsafe.Pointer(backing.Index(0).UnsafeAddr())
+				goStride := backing.Index(0).Type().Size()
+				for i := 0; i < count; i++ {
+					elemPtr := unsafe.Add(backingBase, uintptr(i)*goStride)
+					sszOff := i * elemSize
+					for j := range plan {
+						e := &plan[j]
+						dst := unsafe.Slice((*byte)(unsafe.Add(elemPtr, e.goOff)), e.size)
+						copy(dst, sszBuf[sszOff+e.sszOff:sszOff+e.sszOff+e.size])
+					}
+				}
+				return nil
+			}
 		}
+	}
+
+	for i := 0; i < count; i++ {
+		itemVal := newValue.Index(i)
 
 		expectedPos := decoder.GetPosition() + itemSize
 
@@ -1119,4 +1144,86 @@ func (ctx *ReflectionCtx) unmarshalBigInt(_ *ssztypes.TypeDescriptor, targetValu
 	targetValue.Set(reflect.ValueOf(*bigInt))
 
 	return nil
+}
+
+// batchCopyEntry describes a field copy within one element: SSZ offset → Go struct offset.
+type batchCopyEntry struct {
+	sszOff int
+	goOff  uintptr
+	size   int
+}
+
+// batchCopyPlanCache caches pre-computed copy plans per TypeDescriptor.
+var batchCopyPlanCache sync.Map // map[*ssztypes.TypeDescriptor][]batchCopyEntry
+
+// isDirectCopyableField checks if a field's SSZ encoding is byte-compatible
+// with Go's in-memory representation on little-endian architectures.
+func isDirectCopyableField(fieldType *ssztypes.TypeDescriptor) bool {
+	switch fieldType.SszType {
+	case ssztypes.SszBoolType, ssztypes.SszUint8Type, ssztypes.SszUint16Type,
+		ssztypes.SszUint32Type, ssztypes.SszUint64Type:
+		return fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsTime == 0
+	case ssztypes.SszVectorType:
+		return fieldType.Kind == reflect.Array &&
+			fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 &&
+			fieldType.GoTypeFlags&ssztypes.GoTypeFlagIsString == 0 &&
+			fieldType.BitSize == 0
+	default:
+		return false
+	}
+}
+
+// getBatchCopyPlan returns a cached copy plan for batch-decoding elements of a static container.
+// Returns nil if the container isn't eligible for direct copy.
+func getBatchCopyPlan(containerType *ssztypes.TypeDescriptor, elemGoType reflect.Type) []batchCopyEntry {
+	if plan, ok := batchCopyPlanCache.Load(containerType); ok {
+		return plan.([]batchCopyEntry)
+	}
+
+	// Check eligibility: all fields must be byte-copyable, and SSZ sizes must match Go sizes
+	structType := elemGoType
+	if structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+	}
+	if structType.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := containerType.ContainerDesc.Fields
+	for i := 0; i < len(fields); i++ {
+		if !isDirectCopyableField(fields[i].Type) {
+			return nil
+		}
+		if uint32(structType.Field(i).Type.Size()) < fields[i].Type.Size {
+			return nil
+		}
+	}
+
+	// Build raw plan
+	raw := make([]batchCopyEntry, 0, len(fields))
+	sszOff := 0
+	for i := 0; i < len(fields); i++ {
+		fieldSize := int(fields[i].Type.Size)
+		raw = append(raw, batchCopyEntry{
+			sszOff: sszOff,
+			goOff:  structType.Field(i).Offset,
+			size:   fieldSize,
+		})
+		sszOff += fieldSize
+	}
+
+	// Merge adjacent entries with contiguous SSZ and Go offsets
+	plan := make([]batchCopyEntry, 0, len(raw))
+	for i := 0; i < len(raw); i++ {
+		entry := raw[i]
+		for i+1 < len(raw) &&
+			raw[i+1].sszOff == entry.sszOff+entry.size &&
+			raw[i+1].goOff == entry.goOff+uintptr(entry.size) {
+			entry.size += raw[i+1].size
+			i++
+		}
+		plan = append(plan, entry)
+	}
+
+	batchCopyPlanCache.Store(containerType, plan)
+	return plan
 }
