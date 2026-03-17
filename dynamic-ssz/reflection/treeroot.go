@@ -566,6 +566,13 @@ func (ctx *ReflectionCtx) buildRootFromVector(sourceType *ssztypes.TypeDescripto
 			}
 		}
 
+		// For exactly 32 bytes with no padding: Merkleize is a no-op (single chunk = root).
+		// Use PutBytes directly to avoid the Merkleize overhead.
+		if len(bytes) == 32 && appendZero == 0 {
+			hh.PutBytes(bytes)
+			return nil
+		}
+
 		hh.AppendBytes32(bytes)
 	} else {
 		// For other types, process each element
@@ -661,14 +668,29 @@ func (ctx *ReflectionCtx) buildRootFromList(sourceType *ssztypes.TypeDescriptor,
 		elemDesc := sourceType.ElemDesc
 		batchHTR := false
 		if arrayLen > 0 && sourceValue.CanAddr() &&
-			elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer == 0 &&
-			isBasicIntType(elemDesc) {
+			elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsPointer == 0 {
 			elemGoSize := sourceValue.Type().Elem().Size()
-			if uintptr(elemDesc.Size) == elemGoSize {
+			if isBasicIntType(elemDesc) && uintptr(elemDesc.Size) == elemGoSize {
+				// Bulk append for basic integer types (uint8/16/32/64)
 				totalBytes := arrayLen * int(elemDesc.Size)
 				basePtr := unsafe.Pointer(sourceValue.Index(0).UnsafeAddr())
 				src := unsafe.Slice((*byte)(basePtr), totalBytes)
 				hh.AppendBytes32(src)
+				batchHTR = true
+			} else if elemDesc.SszType == ssztypes.SszVectorType &&
+				elemDesc.GoTypeFlags&ssztypes.GoTypeFlagIsByteArray != 0 &&
+				elemDesc.Kind == reflect.Array &&
+				elemDesc.Size == 32 && elemGoSize == 32 {
+				// Fast path for [][32]byte (e.g. []Root): each element IS a 32-byte
+				// hash chunk, so PutBytes per element skips buildRootFromType/Vector.
+				basePtr := unsafe.Pointer(sourceValue.Index(0).UnsafeAddr())
+				for i := 0; i < arrayLen; i++ {
+					src := unsafe.Slice((*byte)(unsafe.Add(basePtr, uintptr(i)*32)), 32)
+					hh.PutBytes(src)
+					if (i+1)%128 == 0 {
+						hh.Collapse()
+					}
+				}
 				batchHTR = true
 			}
 		}
