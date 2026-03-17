@@ -319,6 +319,24 @@ func (ctx *ReflectionCtx) unmarshalContainer(targetType *ssztypes.TypeDescriptor
 			return sszutils.ErrUnexpectedEOF
 		}
 
+		// Ultra-fast path: batch copy for containers with all basic fields
+		if decoder.Seekable() && targetValue.CanAddr() {
+			if plan := getBatchCopyPlan(targetType, targetValue.Type()); plan != nil {
+				totalSize := int(targetType.Len)
+				sszBuf, err := decoder.DecodeBytesBuf(totalSize)
+				if err != nil {
+					return err
+				}
+				basePtr := unsafe.Pointer(targetValue.UnsafeAddr())
+				for i := range plan {
+					e := &plan[i]
+					dst := unsafe.Slice((*byte)(unsafe.Add(basePtr, e.goOff)), e.size)
+					copy(dst, sszBuf[e.sszOff:e.sszOff+e.size])
+				}
+				return nil
+			}
+		}
+
 		fields := targetType.ContainerDesc.Fields
 		for i := 0; i < len(fields); i++ {
 			field := &fields[i]
