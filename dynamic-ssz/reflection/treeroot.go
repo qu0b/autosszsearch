@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/pk910/dynamic-ssz/hasher"
 	"github.com/pk910/dynamic-ssz/ssztypes"
@@ -341,6 +342,21 @@ func (ctx *ReflectionCtx) buildRootFromLargeUint(sourceType *ssztypes.TypeDescri
 // using binary tree hashing with zero-padding to the next power of two.
 func (ctx *ReflectionCtx) buildRootFromContainer(sourceType *ssztypes.TypeDescriptor, sourceValue reflect.Value, hh sszutils.HashWalker, idt int) error {
 	hashIndex := hh.StartTree(sszutils.TreeTypeNone)
+
+	// Fast path for all-static containers (e.g. Validator): inline hashing
+	// per field using unsafe, skipping buildRootFromType dispatch overhead.
+	if len(sourceType.ContainerDesc.DynFields) == 0 && sourceValue.CanAddr() && !ctx.verbose {
+		if plan := getHTRPlan(sourceType, sourceValue.Type()); plan != nil {
+			basePtr := unsafe.Pointer(sourceValue.UnsafeAddr())
+			for i := range plan {
+				e := &plan[i]
+				src := unsafe.Slice((*byte)(unsafe.Add(basePtr, e.goOff)), e.size)
+				hh.PutBytes(src)
+			}
+			hh.Merkleize(hashIndex)
+			return nil
+		}
+	}
 
 	htrFields := sourceType.ContainerDesc.Fields
 	for i := 0; i < len(htrFields); i++ {

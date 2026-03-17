@@ -1174,6 +1174,51 @@ type batchCopyEntry struct {
 // batchCopyPlanCache caches pre-computed copy plans per TypeDescriptor.
 var batchCopyPlanCache sync.Map // map[*ssztypes.TypeDescriptor][]batchCopyEntry
 
+// htrPlanEntry describes a single field for HTR: Go struct offset + field byte size.
+// Unlike batchCopyEntry, these are NOT merged (each field needs its own 32-byte hash root).
+type htrPlanEntry struct {
+	goOff uintptr
+	size  int
+}
+
+// htrPlanCache caches per-field HTR plans.
+var htrPlanCache sync.Map // map[*ssztypes.TypeDescriptor][]htrPlanEntry
+
+// getHTRPlan returns a cached per-field HTR plan for static containers with only basic fields.
+// Returns nil if the container isn't eligible.
+func getHTRPlan(containerType *ssztypes.TypeDescriptor, goType reflect.Type) []htrPlanEntry {
+	if plan, ok := htrPlanCache.Load(containerType); ok {
+		return plan.([]htrPlanEntry)
+	}
+
+	structType := goType
+	if structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+	}
+	if structType.Kind() != reflect.Struct {
+		return nil
+	}
+	fields := containerType.ContainerDesc.Fields
+	for i := range fields {
+		if !isDirectCopyableField(fields[i].Type) {
+			return nil
+		}
+		if uint32(structType.Field(i).Type.Size()) < fields[i].Type.Size {
+			return nil
+		}
+	}
+
+	plan := make([]htrPlanEntry, len(fields))
+	for i := range fields {
+		plan[i] = htrPlanEntry{
+			goOff: structType.Field(i).Offset,
+			size:  int(fields[i].Type.Size),
+		}
+	}
+	htrPlanCache.Store(containerType, plan)
+	return plan
+}
+
 // isBulkMemcpyable checks if an element type can be bulk-copied in lists/vectors.
 // Similar to isDirectCopyableField but excludes SszBoolType because bool values
 // require per-element validation (0x00 or 0x01 only).
